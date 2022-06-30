@@ -1,0 +1,148 @@
+create or replace database Name_Surname;
+
+create or replace warehouse LOAD_WH with
+  warehouse_size='X-SMALL'
+  auto_suspend = 180
+  auto_resume = true
+  initially_suspended=true;
+  
+create or replace warehouse COMPUTE_WH with
+  warehouse_size='X-SMALL'
+  auto_suspend = 180
+  auto_resume = true
+  initially_suspended=true;
+
+create or replace stage citibiketrips url='s3://snowflake-workshop-lab/citibike-trips/';
+
+create or replace stage weathernyc url='s3://snowflake-workshop-lab/weather-nyc';
+
+create or replace schema data_store;
+
+create or replace table data_store.trips(
+    TRIPDURATION            integer,
+    STARTTIME               timestamp,
+    STOPTIME                timestamp,
+    START_STATION_ID        integer,
+    START_STATION_NAME      string,
+    START_STATION_LATITUDE  float,
+    START_STATION_LONGITUDE float,
+    END_STATION_ID          integer,
+    END_STATION_NAME        string,
+    END_STATION_LATITUDE    float,
+    END_STATION_LONGITUDE   float,
+    BIKEID                  integer,
+    MEMBERSHIP_TYPE         string,
+    USERTYPE                string,
+    BIRTH_YEAR              integer,
+    GENDER                  integer
+);
+
+list @public.citibiketrips;
+
+create or replace file format file_format_csv
+    TYPE = 'CSV'
+    FIELD_OPTIONALLY_ENCLOSED_BY = '\042'
+    NULL_IF = ('NULL','null','')
+    ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE;
+
+copy into data_store.trips from @citibiketrips
+  FILE_FORMAT = file_format_csv
+  ON_ERROR = CONTINUE
+  PATTERN='.*csv.gz';
+  
+create or replace table data_store.json_weather(
+    var variant 
+);
+
+create or replace file format file_format_json
+    TYPE = 'JSON';
+
+copy into data_store.json_weather from @public.weathernyc
+    FILE_FORMAT = file_format_json;
+
+
+create or replace table data_store.weather(
+    observation_time    timestamp, 
+    city_id             integer, 
+    city_name           string, 
+    country             string, 
+    clouds              integer, 
+    weather             string, 
+    weather_description string, 
+    wind_speed          float
+);
+
+create or replace stream weather_stream on table data_store.json_weather;
+
+select * from weather_stream;
+
+select 
+    var:"time", 
+    var:"city"."id", 
+    var:"city"."name", 
+    var:"city"."country", 
+    var:"clouds"."all", 
+    var:"weather"[0]."main", 
+    var:"weather"[0]."description", 
+    var:"wind"."speed" 
+from weather_stream;
+
+create or replace stream weather_stream on table data_store.json_weather;
+
+create task weathertask
+  warehouse = COMPUTE_WH
+when
+  SYSTEM$STREAM_HAS_DATA('weather_stream')
+as
+  insert into data_store.weather(observation_time, city_id, city_name, country, clouds, weather, weather_description, wind_speed) 
+  select 
+  var:"time", 
+  var:"city"."id", 
+  var:"city"."name", 
+  var:"city"."country", 
+  var:"clouds"."all", 
+  var:"weather"[0]."main", 
+  var:"weather"[0]."description", 
+  var:"wind"."speed" 
+from weather_stream;
+
+execute task weathertask;
+
+
+
+
+create or replace schema data_marts;
+
+create or replace view data_marts.trips_during_weather_view as(
+    select 
+      weather as weather_condition,
+      count(*) as number_of_trips
+    from (
+        data_store.trips left outer join data_store.weather on 
+        DATE_TRUNC('HOUR', weather.OBSERVATION_TIME) = DATE_TRUNC('HOUR', data_store.trips.STARTTIME)
+    ) 
+    where OBSERVATION_TIME is not null
+    group by weather
+);
+
+create or replace view data_marts.most_famous_start_points_view as(
+    select 
+        START_STATION_NAME as start_point, 
+        count(*) as number_of_trips  
+    from data_store.trips 
+        group by START_STATION_NAME
+        order by number_of_trips DESC
+);
+
+create role shop_manager;
+
+grant role shop_manager to user Regyl;
+
+drop role shop_manager;
+
+grant usage on warehouse LOAD_WH to role shop_manager;
+
+grant usage on database Name_Surname to role shop_manager;
+grant usage on schema Name_Surname.data_marts to role shop_manager;
+grant select on view data_marts.trips_during_weather_view  to role shop_manager;
+grant select on view data_marts.most_famous_start_points_view to role shop_manager;
